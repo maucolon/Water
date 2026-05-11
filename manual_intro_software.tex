@@ -1,0 +1,279 @@
+% Add these lines to the Overleaf preamble if they are not already included:
+% \usepackage{tikz}
+% \usetikzlibrary{arrows.meta, positioning, shapes.geometric, fit}
+
+\chapter{Introduction}
+
+This directed study focuses on the design and implementation of a command-driven IoT water transfer system. The project uses an Arduino-based controller, WiFi communication, flow measurement, distance sensing, and pump control to move a requested amount of water between two containers. The capstone project serves as the technical foundation for the sensor and actuator concepts, but this manual focuses on the directed study version of the system.
+
+The main goal of the directed study is to move from an automatic, threshold-based water dispensing model toward a user-controlled transfer model. Instead of activating a pump only when a water level condition is met, the user can send a command over the network and request a specific transfer. This makes the system more flexible because the water movement is controlled by software instructions rather than only by a fixed sensor trigger.
+
+The directed study system is organized around two tanks, labeled Tank A and Tank B. Pump 1 transfers water from Tank A to Tank B, while Pump 2 transfers water from Tank B to Tank A. This creates a bidirectional water transfer system. The user can choose the direction and the amount of water to move, and the Arduino monitors the transfer until the target volume is reached.
+
+The software is split into two main parts. The first part is the Arduino firmware, which runs on the microcontroller and handles the physical system. It connects to WiFi, receives commands, reads the sensors, controls the pumps, calculates transferred volume, and stops the active pump when the requested amount has been reached. The second part is an OCaml controller program, which runs on a computer and gives the user a simpler way to send commands to the Arduino.
+
+The system communicates using a simple text-based TCP protocol. Commands such as \texttt{hello}, \texttt{status}, \texttt{measure}, \texttt{stop}, and \texttt{transfer,A,B,<liters>} are sent to the Arduino over WiFi. The Arduino responds with short status or error messages. This direct protocol makes the system easy to test and also leaves room for a future web interface to send the same commands.
+
+This section of the manual describes the directed study software design. It explains the Arduino firmware, the OCaml controller, the command protocol, and the sequence of events that occurs when a user requests a water transfer.
+
+\chapter{Software}
+
+The software system is divided into two programs: the OCaml controller and the Arduino firmware. The OCaml controller handles user commands and network communication. The Arduino firmware handles WiFi reception, sensor readings, pump control, and volume tracking.
+
+\section{Software Overview}
+
+Figure~\ref{fig:software-flow} shows the path of a command through the directed study system. The user begins by entering a command on the computer. The OCaml program checks and formats the command, sends it to the Arduino over WiFi, and then waits for a response. The Arduino receives the command, updates its state machine, controls the correct pump, and monitors the transfer with the flow sensor.
+
+\begin{figure}[H]
+\centering
+\resizebox{\textwidth}{!}{%
+\begin{tikzpicture}[
+    node distance=1.4cm and 1.7cm,
+    block/.style={
+        rectangle,
+        rounded corners=3pt,
+        draw=black,
+        thick,
+        align=center,
+        minimum width=3.2cm,
+        minimum height=1.1cm,
+        fill=gray!8
+    },
+    decision/.style={
+        diamond,
+        draw=black,
+        thick,
+        align=center,
+        aspect=2,
+        inner sep=1pt,
+        fill=blue!7
+    },
+    io/.style={
+        rectangle,
+        rounded corners=3pt,
+        draw=black,
+        thick,
+        align=center,
+        minimum width=3.3cm,
+        minimum height=1.1cm,
+        fill=green!8
+    },
+    action/.style={
+        rectangle,
+        rounded corners=3pt,
+        draw=black,
+        thick,
+        align=center,
+        minimum width=3.4cm,
+        minimum height=1.1cm,
+        fill=orange!10
+    },
+    arrow/.style={-{Latex[length=3mm]}, thick}
+]
+
+\node[io] (user) {User enters command\\\texttt{transfer A B 1.5}};
+\node[block, right=of user] (parse) {OCaml parses input\\and validates liters};
+\node[block, right=of parse] (format) {Command formatted\\\texttt{transfer,A,B,1.500}};
+\node[io, right=of format] (tcp) {TCP socket over WiFi\\Arduino IP + port 4080};
+
+\node[block, below=of tcp] (receive) {Arduino receives\\newline command};
+\node[decision, left=of receive] (route) {Valid\\command?};
+\node[action, left=of route] (start) {Start selected pump\\Pump 1 or Pump 2};
+\node[block, left=of start] (sense) {Read flow pulses\\and distance sensor};
+
+\node[decision, below=of sense] (target) {Target\\liters reached?};
+\node[action, right=of target] (stop) {Stop pumps\\reset transfer state};
+\node[io, right=of stop] (response) {Send response\\\texttt{ok} or \texttt{err}};
+\node[block, right=of response] (display) {OCaml displays\\Arduino response};
+
+\draw[arrow] (user) -- (parse);
+\draw[arrow] (parse) -- (format);
+\draw[arrow] (format) -- (tcp);
+\draw[arrow] (tcp) -- (receive);
+\draw[arrow] (receive) -- (route);
+\draw[arrow] (route) -- node[above] {yes} (start);
+\draw[arrow] (route.north) |- node[pos=0.25, right] {no} (response.north);
+\draw[arrow] (start) -- (sense);
+\draw[arrow] (sense) -- (target);
+\draw[arrow] (target) -- node[above] {yes} (stop);
+\draw[arrow] (stop) -- (response);
+\draw[arrow] (response) -- (display);
+\draw[arrow] (target.west) -- ++(-1.0,0) |- node[pos=0.25, left] {no} (sense.west);
+
+\end{tikzpicture}%
+}
+\caption{Software command flow from user input to Arduino pump control}
+\label{fig:software-flow}
+\end{figure}
+
+The key idea is that the computer does not directly control the pump pins. It sends a clear instruction to the Arduino, and the Arduino remains responsible for the real-time hardware behavior.
+
+\section{Arduino Firmware}
+
+The current directed-study Arduino sketch is \texttt{directed\_study.ino}. It is the main firmware for the dual-pump transfer system. The firmware uses the \texttt{WiFiS3} library so the Arduino can join a WiFi network and accept commands from another computer on the same network.
+
+The firmware defines two pump directions:
+
+\begin{itemize}
+    \item \texttt{A\_TO\_B}: Pump 1 moves water from Tank A to Tank B.
+    \item \texttt{B\_TO\_A}: Pump 2 moves water from Tank B to Tank A.
+\end{itemize}
+
+The pump hardware is controlled through H-bridge pins. Before one pump starts, the firmware stops the other pump. This is an important safety and control decision because it prevents the two pumps from fighting each other or moving water in both directions at once.
+
+The firmware also reads two sensors:
+
+\begin{itemize}
+    \item The flow sensor counts pulses as water moves through the system.
+    \item The ultrasonic sensor measures distance in centimeters.
+\end{itemize}
+
+The flow sensor is connected to an interrupt pin. Each pulse increases a counter called \texttt{flowPulses}. The software uses the calibration value:
+
+\[
+\texttt{PULSES\_PER\_LITER} = 5880
+\]
+
+This value comes from the flow sensor relationship:
+
+\[
+F(Hz) = 98 \times Q(L/min)
+\]
+
+Since there are 60 seconds in a minute, the pulse estimate becomes:
+
+\[
+98 \times 60 = 5880 \text{ pulses per liter}
+\]
+
+During a transfer, the firmware records the pulse count at the start of the cycle. It then compares the current pulse count to the starting pulse count. The difference is converted into liters:
+
+\[
+\text{dispensed liters} = \frac{\text{current pulses} - \text{starting pulses}}{5880}
+\]
+
+When the calculated dispensed volume reaches the requested target volume, the firmware stops the pump and resets the transfer state.
+
+\section{Arduino State Machine}
+
+The Arduino program uses a state machine to keep the software behavior predictable.
+
+\begin{description}
+    \item[\texttt{INIT}] Connects to WiFi, prints network information, and starts the TCP server.
+    \item[\texttt{GET\_REQUEST}] Checks whether a client has connected and sent a command.
+    \item[\texttt{PARSE\_REQUEST}] Reads the command and calls the correct command handler.
+    \item[\texttt{SENSE}] Reads the ultrasonic sensor and updates the current transfer volume using the flow sensor pulse count.
+    \item[\texttt{THINK}] Decides whether the active transfer has reached the target volume.
+    \item[\texttt{ACT}] Stops the pumps when the target volume has been reached.
+\end{description}
+
+This pattern follows the sense-think-act structure used in the original capstone project. The directed study version keeps that organization but adds more direct command control through the network.
+
+\section{Supported Arduino Commands}
+
+The Arduino receives newline-terminated text commands. Each command is short and human-readable.
+
+\begin{table}[H]
+\centering
+\begin{tabular}{lll}
+\toprule
+\textbf{Command} & \textbf{Purpose} & \textbf{Example Response} \\
+\midrule
+\texttt{hello} & Confirms communication with the Arduino & \texttt{ok:transfer\_dualpump\_v1} \\
+\texttt{status} & Reports direction, pulses, liters, target, pump state, and distance & \texttt{status:dir=A\_TO\_B ...} \\
+\texttt{measure} & Reads the ultrasonic distance sensor & \texttt{measure:24.50} \\
+\texttt{stop} & Stops all active pumping & \texttt{ok:stopped} \\
+\texttt{dispense,<liters>} & Legacy command for Tank A to Tank B transfer & \texttt{ok:dispense\_set} \\
+\texttt{transfer,A,B,<liters>} & Transfers water from Tank A to Tank B & \texttt{ok:transfer\_set:A\_TO\_B} \\
+\texttt{transfer,B,A,<liters>} & Transfers water from Tank B to Tank A & \texttt{ok:transfer\_set:B\_TO\_A} \\
+\bottomrule
+\end{tabular}
+\caption{Arduino TCP command protocol}
+\end{table}
+
+The firmware also includes basic error responses. If the user sends a command while a transfer is already active, the Arduino returns \texttt{err:busy}. If the requested amount is invalid, it returns \texttt{err:bad\_value}. If the route is not valid, it returns \texttt{err:bad\_route}. These responses make it easier for the controller software or a future website interface to understand what happened.
+
+\section{OCaml Controller}
+
+The OCaml software is contained in \texttt{dispenser.ml}. This program is the user-side controller for the Arduino transfer system. Its main job is to make the Arduino easier to control from a computer. Instead of manually opening a raw socket and typing Arduino protocol messages, the user can type simpler commands.
+
+For example, the user can type:
+
+\begin{verbatim}
+transfer A B 2
+\end{verbatim}
+
+The OCaml program converts that into:
+
+\begin{verbatim}
+transfer,A,B,2.000
+\end{verbatim}
+
+That converted line is then sent to the Arduino over TCP.
+
+The OCaml program supports three operating modes:
+
+\begin{itemize}
+    \item \textbf{REPL mode}: The user enters commands one at a time in an interactive prompt.
+    \item \textbf{One-command mode}: The user sends a single command using the \texttt{--cmd} option.
+    \item \textbf{Script mode}: The user provides a file of commands using the \texttt{--file} option.
+\end{itemize}
+
+The controller is run through Dune with a command like:
+
+\begin{verbatim}
+dune exec ./dispenser.exe -- --host 192.168.1.142 --port 4080
+\end{verbatim}
+
+The \texttt{--host} value must match the Arduino IP address printed in the Arduino Serial Monitor after it connects to WiFi. The port is \texttt{4080}, matching the TCP server port in the Arduino firmware.
+
+\section{OCaml Command Parsing}
+
+The OCaml program defines a command type that represents all supported user commands. These include \texttt{Hello}, \texttt{Status}, \texttt{Measure}, \texttt{Stop}, \texttt{Dispense}, \texttt{Transfer}, \texttt{RunPump}, \texttt{Help}, and \texttt{Quit}.
+
+When the user enters a command, the program trims extra spaces, splits the input into words, checks whether the command is valid, and validates the requested liter amount. The liter value must be greater than zero. This prevents invalid commands from being sent to the Arduino.
+
+The program also supports aliases:
+
+\begin{itemize}
+    \item \texttt{dispense <liters>} is treated as the older one-way transfer command.
+    \item \texttt{pump1 <liters>} maps to Tank A to Tank B.
+    \item \texttt{pump2 <liters>} maps to Tank B to Tank A.
+\end{itemize}
+
+These aliases make testing easier because the user can choose between tank-based commands and pump-based commands.
+
+\section{Network Communication}
+
+The OCaml controller and Arduino communicate using a simple TCP connection. For each user command, the OCaml program opens a socket, connects to the Arduino, sends one newline-terminated command, waits for one response line, prints the response, and closes the socket.
+
+This design keeps the communication simple. Each connection represents one command and one response. That makes the system easier to test because every command can be checked independently.
+
+The basic communication sequence is:
+
+\begin{enumerate}
+    \item The Arduino connects to WiFi and starts a TCP server on port \texttt{4080}.
+    \item The user runs the OCaml controller with the Arduino IP address.
+    \item The user enters a command such as \texttt{transfer A B 1.5}.
+    \item The OCaml controller converts the command into Arduino protocol format.
+    \item The controller sends the command to the Arduino.
+    \item The Arduino parses the command and starts the requested action.
+    \item The Arduino sends back a response such as \texttt{ok:transfer\_set:A\_TO\_B}.
+    \item The Arduino continues sensing and stops the pump when the target volume is reached.
+\end{enumerate}
+
+\section{Directed Study Software Focus}
+
+The capstone documentation is used as a reference for the sensor behavior, flow calibration, and original pump control approach. The directed study software focuses on the newer control model. The most important software change is that the Arduino is now treated as a network-controlled device. A separate controller program sends instructions to it, and the Arduino performs the requested action.
+
+The directed study version therefore emphasizes:
+
+\begin{itemize}
+    \item direct user commands over WiFi,
+    \item bidirectional water transfer between Tank A and Tank B,
+    \item flow-based volume tracking,
+    \item pump safety through one-pump-at-a-time control,
+    \item simple command responses for testing and future interface development.
+\end{itemize}
+
+This keeps the manual centered on the current project while still using the capstone material as background information where it is useful.

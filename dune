@@ -1,0 +1,4 @@
+(executable
+ (name dispenser)
+ (modules dispenser)
+ (libraries unix))
